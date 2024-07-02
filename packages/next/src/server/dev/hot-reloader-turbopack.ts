@@ -871,7 +871,7 @@ export async function createHotReloaderTurbopack(
   await currentEntriesHandling
   await manifestLoader.writeManifests({
     rewrites: opts.fsChecker.rewrites,
-    pageEntrypoints: currentEntrypoints.page,
+    entrypoints: currentEntrypoints,
   })
 
   async function handleProjectUpdates() {
