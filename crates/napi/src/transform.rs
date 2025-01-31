@@ -35,14 +35,15 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context as _};
+use dashmap::DashMap;
 use fxhash::FxHashSet;
 use napi::bindgen_prelude::*;
 use next_custom_transforms::chain_transforms::{custom_before_pass, TransformOptions};
 use once_cell::sync::Lazy;
-use turbopack_binding::swc::core::{
+use swc_core::{
     base::{try_with_handler, Compiler, TransformOutput},
     common::{comments::SingleThreadedComments, errors::ColorConfig, FileName, Mark, GLOBALS},
-    ecma::transforms::base::pass::noop,
+    ecma::ast::noop_pass,
 };
 
 use crate::{complete_output, get_compiler, util::MapErr};
@@ -81,16 +82,18 @@ fn skip_filename() -> bool {
 }
 
 impl Task for TransformTask {
-    type Output = (TransformOutput, FxHashSet<String>);
+    type Output = (TransformOutput, FxHashSet<String>, DashMap<String, usize>);
     type JsValue = Object;
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
         GLOBALS.set(&Default::default(), || {
             let eliminated_packages: Rc<RefCell<fxhash::FxHashSet<String>>> = Default::default();
+            let use_cache_telemetry_tracker: Rc<DashMap<String, usize>> = Default::default();
+
             let res = catch_unwind(AssertUnwindSafe(|| {
                 try_with_handler(
                     self.c.cm.clone(),
-                    turbopack_binding::swc::core::base::HandlerOpts {
+                    swc_core::base::HandlerOpts {
                         color: ColorConfig::Always,
                         skip_filename: skip_filename(),
                     },
@@ -105,7 +108,7 @@ impl Task for TransformTask {
                                         FileName::Real(options.swc.filename.clone().into())
                                     };
 
-                                    self.c.cm.new_source_file(filename, src.to_string())
+                                    self.c.cm.new_source_file(filename.into(), src.to_string())
                                 }
                                 Input::FromFilename => {
                                     let filename = &options.swc.filename;
@@ -114,7 +117,7 @@ impl Task for TransformTask {
                                     }
 
                                     self.c.cm.new_source_file(
-                                        FileName::Real(filename.into()),
+                                        FileName::Real(filename.into()).into(),
                                         read_to_string(filename).with_context(|| {
                                             format!("Failed to read source code from {}", filename)
                                         })?,
@@ -143,9 +146,10 @@ impl Task for TransformTask {
                                         comments.clone(),
                                         eliminated_packages.clone(),
                                         unresolved_mark,
+                                        use_cache_telemetry_tracker.clone(),
                                     )
                                 },
-                                |_| noop(),
+                                |_| noop_pass(),
                             )
                         })
                     },
@@ -161,7 +165,13 @@ impl Task for TransformTask {
 
             match res {
                 Ok(res) => res
-                    .map(|o| (o, eliminated_packages.replace(Default::default())))
+                    .map(|o| {
+                        (
+                            o,
+                            eliminated_packages.replace(Default::default()),
+                            (*use_cache_telemetry_tracker).clone(),
+                        )
+                    })
                     .convert_err(),
                 Err(err) => Err(napi::Error::new(
                     Status::GenericFailure,
@@ -174,9 +184,14 @@ impl Task for TransformTask {
     fn resolve(
         &mut self,
         env: Env,
-        (output, eliminated_packages): Self::Output,
+        (output, eliminated_packages, use_cache_telemetry_tracker): Self::Output,
     ) -> napi::Result<Self::JsValue> {
-        complete_output(&env, output, eliminated_packages)
+        complete_output(
+            &env,
+            output,
+            eliminated_packages,
+            use_cache_telemetry_tracker,
+        )
     }
 }
 
